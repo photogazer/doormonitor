@@ -66,13 +66,18 @@ const String TO_EMAIL_ADDRESS = "";
 #define NUM_CAL_SAMPLES 4    /* # samples to use in calibration */
 #define SAMPLE_PERIOD   1000   /* sample rate in ms */
 #define DISARM_PERIOD   (1000 * 60)  /* after sending a notification, disarm for a period of time */
+#define LED_ON_PERIOD   2000   /* How long to leave LED ON after sending a notification */
 
 #define THRESHOLD       12 /* Threshold beyond which movement is detected. Deviation in one dimension by more than 3 is classified as movement */
-//#define MOVEMENT_COUNT  (2000 / SAMPLE_PERIOD)  /* Door lock has to be in the same state for 2 sec for the state to become official */
 
 #define BAUD_RATE    115200  /* Serial baud rate */
 #define SETTLE_TIME  3000    /* Amount of time to wait between power up and calibration */
 
+#define PACKET_LEN 255      /* max length of incoming packet */
+#define REMOTE_PORT 1743    /* port of board on patio door */
+#define NOTIFY "notify"     /* string to notify patio door board */
+#define ACK "ack"           /* a string to send back  */
+#define NUM_RETRIES 10      /* number of UDP resents to do til we give up */
 
 BMA222 mySensor;
 int8_t nonMovingX, nonMovingY, nonMovingZ;    /* stationary parameters */
@@ -82,6 +87,14 @@ boolean firstTime = true;     /* First run after power on? */
 
 // Wifi client
 WiFiClient client;
+
+// Wifi server
+char packetBuffer[255];          /* buffer to hold incoming packet */
+WiFiUDP Udp;
+
+/* Set the broadcast address for the board on patio door */
+IPAddress broadcastIp(192, 168, 0, 255);   
+
 
 void setupWifi() {
   int wifiStatus = WL_IDLE_STATUS;
@@ -109,6 +122,11 @@ void setupWifi() {
     }
     delay(5000);
   }
+
+  printWifiStatus();
+
+  Serial.println("\nStarting UDP server...");
+  Udp.begin(REMOTE_PORT);
 }
 
 void sendEmail(boolean moving) {
@@ -248,6 +266,104 @@ boolean detectMovement(int8_t X, int8_t Y, int8_t Z)
   }
 }
 
+void printWifiStatus() {
+  // print the SSID of the network you're attached to:
+  Serial.print("SSID: ");
+  Serial.println(WiFi.SSID());
+
+  // print your WiFi shield's IP address:
+  IPAddress ip = WiFi.localIP();
+  Serial.print("IP Address: ");
+  Serial.println(ip);
+
+  // print the received signal strength:
+  long rssi = WiFi.RSSI();
+  Serial.print("signal strength (RSSI):");
+  Serial.print(rssi);
+  Serial.println(" dBm");
+}
+
+void notifyPatioDoor()
+{
+  bool done = false;
+  int retries = NUM_RETRIES;
+  IPAddress remoteIp;
+  int packetSize;
+
+  /* Clear previous packets, if any */
+  do {
+    packetSize = Udp.parsePacket();
+    if (packetSize) {
+      // read the packet into packetBufffer
+      int len = Udp.read(packetBuffer, PACKET_LEN);
+      if (len > 0) {
+        packetBuffer[len] = 0;
+        Serial.println("Cleared contents:");
+        Serial.println(packetBuffer);
+      }
+    }
+  } while (packetSize > 0);
+        
+  /* send until ack received or 'retries' reaches zero */
+  while (!done) {
+    Serial.println("Sending notification...");     
+    // send a message to the board on the patio door
+    Udp.beginPacket(broadcastIp, REMOTE_PORT);
+    Udp.write(NOTIFY);
+    Udp.endPacket();
+
+    sleep(SAMPLE_PERIOD);
+
+    /* Ignore our own broadcasted packets */
+    while (true) {
+      packetSize = Udp.parsePacket();
+      if (packetSize) {
+        remoteIp = Udp.remoteIP();      
+        if (remoteIp == WiFi.localIP()) {
+          Udp.read(packetBuffer, PACKET_LEN);
+        }
+        else {
+          break;
+        }
+      }
+      else {
+        break;
+      }
+    }
+
+    if (packetSize) {       
+      Serial.print("Received packet of size ");
+      Serial.println(packetSize);
+      Serial.print("From ");
+      Serial.print(remoteIp);
+      Serial.print(", port ");
+      Serial.println(Udp.remotePort());
+  
+      // read the packet into packetBufffer
+      int len = Udp.read(packetBuffer, PACKET_LEN);
+      if (len > 0) {
+        packetBuffer[3] = 0;  /* terminate after first 'ack' string */
+        Serial.println("Contents:");
+        Serial.println(packetBuffer);
+        String receivedStr = String(packetBuffer);
+        if (receivedStr.compareTo(ACK) == 0) {
+          Serial.println("Notification acknowledged!"); 
+          done = true;
+          sleep(LED_ON_PERIOD);
+          digitalWrite(LED, LOW);   // turn the LED off      
+        }
+      }
+    }
+    else {     
+      retries--;
+    }
+    if (retries == 0) {
+      Serial.println("Giving up..."); 
+      done = true;
+    }
+  }
+}
+
 
 void loop()
 {
@@ -255,11 +371,12 @@ void loop()
 
   if (armed == false) {
     if (!firstTime) {  /* Do not wait on initial power on */
-      sleep(DISARM_PERIOD);  /* after a notification, stay quiet for a period */
+      sleep(DISARM_PERIOD - SAMPLE_PERIOD);  /* after a notification, stay quiet for a period */
     }
     else {
       firstTime = false;  
     }
+    digitalWrite(LED, LOW);   // turn the LED off
     armed = true;
     Serial.println("Armed!");    
   }
@@ -273,7 +390,6 @@ void loop()
     if (!detectMovement(dataX, dataY, dataZ)) {
       /* only send a notification on a transition */
       if (moving) {
-        digitalWrite(LED, LOW);   // turn the LED off
         Serial.println("door is not moving");
         moving = false;
       }
@@ -283,7 +399,7 @@ void loop()
         moving = true;
         Serial.println("door is moving");
         digitalWrite(LED, HIGH);   // turn the LED on
-        sendEmail(moving);
+        notifyPatioDoor();
         armed = false;  /* disarm whenever we moved */
       }
     }

@@ -1,4 +1,4 @@
-/* 
+/*
   Instructions:
  
   1. Create a Temboo account: http://www.temboo.com
@@ -68,6 +68,7 @@ const String TO_EMAIL_ADDRESS = "";
 
 #define NUM_CAL_SAMPLES 20    /* # samples to use in calibration */
 #define SAMPLE_PERIOD   500   /* sample rate in ms */
+#define EMAIL_PERIOD    10000 /* cool down time between emails in ms */
 
 #define THRESHOLD       12 /* Threshold beyond which movement is detected. Deviation in one dimension by more than 3 is classified as movement */
 #define MOVEMENT_COUNT  (5000 / SAMPLE_PERIOD)  /* Door lock has to be in the same state for 5 sec for the state to become official */
@@ -75,15 +76,27 @@ const String TO_EMAIL_ADDRESS = "";
 #define BAUD_RATE    115200  /* Serial baud rate */
 #define SETTLE_TIME  10000   /* Amount of time to wait between power up and calibration */
 
+#define PACKET_LEN 255       /* max length of incoming packet */
+#define NOTIFY "notify"      /* string to notify patio door board */
+#define ACK "ack"            /* a string to send back  */
+#define LOCAL_PORT 1743      /* local port to listen on */
+
+/* Set the static IP address for this baord */
+//IPAddress ip(192, 168, 0, 154);    
 
 BMA222 mySensor;
 int8_t nonMovingX, nonMovingY, nonMovingZ;    /* stationary parameters */
-boolean shut = false;    /* Is door shut? */
+boolean shut = true;    /* Is door shut? */
 uint32_t restCount = 0;  /* # readings while door is at rest and shut */
 uint32_t moveCount = 0;  /* # readings while door is moving or open */
 
 // Wifi client
 WiFiClient client;
+
+// Wifi server
+char packetBuffer[255];          /* buffer to hold incoming packet */
+char ReplyBuffer[] = ACK;      /* a string to send back  */
+WiFiUDP Udp;
 
 void setupWifi() {
   int wifiStatus = WL_IDLE_STATUS;
@@ -99,7 +112,10 @@ void setupWifi() {
   else {
     Serial.println("OK\n");
   }
- 
+
+  /* unfortunately this prevents emails from being sent. So the front door would need to broadcast its notifications */
+  //WiFi.config(ip);
+   
   while(wifiStatus != WL_CONNECTED) {
     Serial.print("WiFi:");
     wifiStatus = WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -111,6 +127,11 @@ void setupWifi() {
     }
     delay(5000);
   }
+
+  printWifiStatus();
+           
+  Serial.println("\nStarting UDP server...");
+  Udp.begin(LOCAL_PORT);
 }
 
 void sendEmail(boolean shut) {
@@ -143,7 +164,7 @@ void sendEmail(boolean shut) {
   // next is who to send the email to
   SendEmailChoreo.addInput("ToAddress", TO_EMAIL_ADDRESS);
   // then a subject line
-  SendEmailChoreo.addInput("Subject", "ALERT: Back door status change");
+  SendEmailChoreo.addInput("Subject", "ALERT!");
 
   if (shut) {
     // next comes the message body, the main content of the email   
@@ -250,6 +271,64 @@ boolean detectMovement(int8_t X, int8_t Y, int8_t Z)
   }
 }
 
+void printWifiStatus() {
+  // print the SSID of the network you're attached to:
+  Serial.print("SSID: ");
+  Serial.println(WiFi.SSID());
+
+  // print your WiFi shield's IP address:
+  IPAddress ip = WiFi.localIP();
+  Serial.print("IP Address: ");
+  Serial.println(ip);
+
+  // print the received signal strength:
+  long rssi = WiFi.RSSI();
+  Serial.print("signal strength (RSSI):");
+  Serial.print(rssi);
+  Serial.println(" dBm");
+}
+
+void serviceUdpPackets()
+{
+  /* if there's data available, read a packet */
+  int packetSize = Udp.parsePacket();
+  if (packetSize) {
+    Serial.print("Received packet of size ");
+    Serial.println(packetSize);
+    Serial.print("From ");
+    IPAddress remoteIp = Udp.remoteIP();
+    Serial.print(remoteIp);
+    Serial.print(", port ");
+    Serial.println(Udp.remotePort());
+
+    // read the packet into packetBufffer
+    int len = Udp.read(packetBuffer, PACKET_LEN);
+    if (len > 0) {
+      packetBuffer[len] = 0;
+      Serial.println("Contents:");
+      Serial.println(packetBuffer);
+
+      String receivedStr = String(packetBuffer);
+
+      if (receivedStr.compareTo(NOTIFY) == 0) {
+        // send a reply, to the IP address and port that sent us the packet we received
+        Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
+        Udp.write(ReplyBuffer);
+        Udp.endPacket();
+  
+        if (!shut) {
+          Serial.println("Sending notification email!");
+          sendEmail(shut);
+          sleep(EMAIL_PERIOD);
+          /* flush any duplicate packets */
+          while (Udp.parsePacket() > 0) {
+            sleep(SAMPLE_PERIOD);
+          }
+        }
+      }
+    }
+  }
+}
 
 void loop()
 {
@@ -281,7 +360,6 @@ void loop()
         digitalWrite(LED, LOW);   // turn the LED off
         Serial.println("door is shut");
         shut = true;
-        sendEmail(shut);
       }
     }
   }
@@ -300,10 +378,11 @@ void loop()
         shut = false;
         Serial.println("door is opened");
         digitalWrite(LED, HIGH);   // turn the LED on
-        sendEmail(shut);
       }
     }
   }
-  
+
+  serviceUdpPackets();
+    
   sleep(SAMPLE_PERIOD);  
 }
